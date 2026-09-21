@@ -2,7 +2,7 @@
 // @name         X Image to Telegram
 // @name:zh-CN   X 推文图片发送到 Telegram
 // @namespace    https://github.com/InSnocent/XPhoto2TG
-// @version      1.1.1
+// @version      2.0.0
 // @description  在 X（Twitter）每条推文上增加 Telegram 按钮，将该推文的图片、视频与动图发送到指定 Telegram 频道
 // @author       InSnocent
 // @match        https://x.com/*
@@ -15,36 +15,33 @@
 // @connect      cdn.syndication.twimg.com
 // @connect      abs.twimg.com
 // 注：图片由 pbs.twimg.com 提供，视频/动图本体由 video.twimg.com 提供；
-//     syndication 兜底通路与 Bearer 提取各占一个域名（agent.md §9 不允许 @connect *）。
-//     通路 C 是「同源 fetch 到 x.com」，不需要也不应出现在这里。
+//     公开接口兜底与 Bearer 提取各占一个域名。**不要用 @connect ***。
+//     视频地址走的是「同源 fetch 到 x.com」，不需要也不应出现在这里。
 //     若日志出现「下载失败：网络错误」，把报错中的域名按同样格式加一行即可。
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
 
 /**
- * X Image to Telegram — V1.1
+ * X Image to Telegram — V2
  *
- * 数据流（agent.md §2）：
+ * 数据流：
  *   X DOM → Tweet Parser → Tweet Object → Upload Manager
  *         → Image Downloader / Video Resolver → Telegram Client → Toast / State
  *
- * 已验证的关键路径：
- *   Phase 1：Tweet ID / 作者 URL / 推文 URL / 图片解析、引用推文媒体排除
- *   Phase 2：GM_xmlhttpRequest + Blob + FormData → api.telegram.org 上传
- *   V2     ：动图由封面 hash 拼直链；视频经登录态 GraphQL 取 MP4 档位
+ * 三种媒体的地址来源完全不同，改动前先读第 9b 节顶部说明：
+ *   图片  → DOM 的 img.src
+ *   动图  → 封面 URL 的 hash 直接拼出直链，零接口调用
+ *   视频  → 登录态同源 GraphQL，失败降级到公开接口
  *
- * 明确不支持（agent.md §1）：音频、引用推文媒体、自行拼装 HLS、
- * 浏览器端转码、任何形式的持久化媒体缓存。
- *
- * V2 的完整技术依据见 docs/V2-视频功能技术分析报告.md。
+ * 不支持：音频、引用推文媒体、自行拼装 HLS、浏览器端转码、任何持久化媒体缓存。
  */
 
 (function () {
     'use strict';
 
     // ============================================================
-    // 1. 配置（agent.md §4）—— 所有配置集中在此
+    // 1. 配置 —— 所有配置集中在此
     // ============================================================
     const CONFIG = {
         // 从 @BotFather 获取，形如 123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -58,7 +55,7 @@
         requestTimeoutMs: 30000,
         sendDelayMs: 800,
 
-        // 视频下载的独立超时。V1 的 30s 对几十 MB 的视频不够（报告 §8.3）
+        // 视频下载的独立超时。默认的 30s 对几十 MB 的视频不够
         videoRequestTimeoutMs: 120000,
 
         // 通路 C 的 GraphQL queryId。X 发版后若失效会返回 404，
@@ -71,7 +68,7 @@
 
         // true  → 多图合并为一个相册（album）一次发送，链接作为相册 caption
         // false → 多图逐张串行发送，caption 挂第一张成功的图
-        // 注：本项为对 agent.md §1/§11/§17 的显式变更，详见第 11 节的偏差说明
+        // 注：这是对「多图逐张串行」的显式变更，代价见第 11 节顶部说明
         sendAsAlbum: true,
 
         // true 时输出详细日志（绝不含完整 Bot Token）
@@ -81,7 +78,7 @@
     const PLACEHOLDER_TOKEN = 'YOUR_BOT_TOKEN';
     const PLACEHOLDER_CHAT = 'YOUR_CHANNEL_ID';
 
-    // Telegram 限制（已核实，见 docs/技术分析报告.md §0.2）
+    // Telegram 官方限制（已核实）
     const TG_LIMITS = {
         photoMaxBytes: 10 * 1024 * 1024,   // sendPhoto：10 MB
         documentMaxBytes: 50 * 1024 * 1024, // sendDocument：50 MB
@@ -91,10 +88,10 @@
         captionMaxChars: 1024,
     };
 
-    // 图片质量降级链（agent.md §15）
+    // 图片质量降级链
     const QUALITY_ORDER = ['orig', '4096x4096', 'large', 'medium'];
 
-    // 视频各阶段的按钮文案（报告 §8.2）。视频下载耗时长，
+    // 视频各阶段的按钮文案。视频下载耗时长，
     // 用户需要能看到「卡在哪一步」，否则只会以为脚本死了。
     const VIDEO_STAGE_LABELS = {
         pending: '正在准备视频…',
@@ -134,7 +131,7 @@
         CONFIG.telegramChatId !== PLACEHOLDER_CHAT;
 
     // ============================================================
-    // 3. 日志（agent.md §25、§30）
+    // 3. 日志
     // ============================================================
 
     /** Token 脱敏，任何输出都必须经过它 */
@@ -158,7 +155,7 @@
     }
 
     // ============================================================
-    // 4. 样式与 Toast（agent.md §24：不使用 alert）
+    // 4. 样式与 Toast（不使用 alert）
     // ============================================================
 
     const STYLE = `
@@ -228,12 +225,12 @@
     }
 
     // ============================================================
-    // 5. 状态管理（agent.md §21）
+    // 5. 状态管理
     // ============================================================
 
     /**
      * Map<tweetId, {state, captionSent, lastError, videoState}> —— 仅内存，刷新即清空。
-     * videoState（报告 §8.2）：none | pending | resolving | downloading | sending | done | failed，
+     * videoState：none | pending | resolving | downloading | sending | done | failed，
      * 用于区分「正在解析媒体地址」与「正在下载视频」两个阶段。
      */
     const tweetStates = new Map();
@@ -248,7 +245,7 @@
     }
 
     // ============================================================
-    // 6. 上传队列（agent.md §20：全局并发 = 1）
+    // 6. 上传队列（全局并发 = 1）
     // ============================================================
 
     let queueTail = Promise.resolve();
@@ -287,7 +284,7 @@
     }
 
     // ============================================================
-    // 8. Tweet DOM 解析（Phase 1 已验证）
+    // 8. Tweet DOM 解析
     // ============================================================
 
     function describeEl(el) {
@@ -301,7 +298,7 @@
     }
 
     /**
-     * 引用卡片判定（Phase 1 实测确认）：
+     * 引用卡片判定（已实测）：
      * role="link" 容器 且 内部含 User-Name。
      * 主推文图片外层是 <a role="link">，内部无 User-Name，因此不会被误杀。
      */
@@ -366,7 +363,7 @@
         return null;
     }
 
-    /** 动图封面：形如 pbs.twimg.com/tweet_video_thumb/<hash>.jpg（报告 §0.7） */
+    /** 动图封面：形如 pbs.twimg.com/tweet_video_thumb/<hash>.jpg */
     function gifHashFromPoster(url) {
         if (!url) return null;
         const m = /\/tweet_video_thumb\/([^/?#.]+)/.exec(url);
@@ -381,7 +378,7 @@
     }
 
     /**
-     * 动图封面不能当静态图发送——它属于视频路径（报告 §3.5）。
+     * 动图封面不能当静态图发送——它属于视频路径。
      * 判据：src 是 tweet_video_thumb，或所在 tweetPhoto 容器内有 video。
      */
     function isAnimatedGifCover(img) {
@@ -394,7 +391,7 @@
     /**
      * 只取当前推文自己的视频 / 动图（排除引用推文、卡片、头像内媒体）。
      *
-     * 判定依据（报告 §1.2、§1.3，均已实测）：
+     * 判定依据：
      *   DOM 里 <video src> 是 blob:（MSE），拿不到真实媒体地址；
      *   但 <video poster> 带封面 URL，动图可由它的 hash 直接拼出本体地址。
      */
@@ -416,18 +413,15 @@
 
             const gifHash = gifHashFromPoster(poster);
 
-            // 「动图」必须有正面证据：封面走 tweet_video_thumb（X 的动图专用路径）。
-            //
-            // 【真机教训 2026-09】最初把「位于 tweetPhoto 容器内」也当成动图判据，
-            // 结果真实视频被误判成动图、用 sendAnimation 发出（实测一条 21.17 MB 的
-            // 视频走了 sendAnimation —— X 的 GIF 上限只有 15 MB，它不可能是动图）。
-            // 现在只认封面 URL，容器位置降级为日志线索（inTweetPhoto）。
-            // 类型最终还会由 resolveVideoSource 按选定的媒体 URL 再判一次。
+            // 「动图」必须有正面证据：封面走 tweet_video_thumb。
+            // 不能只看「位于 tweetPhoto 容器内」—— 真实视频的 <video> 也落在该容器里，
+            // 曾因此把视频判成动图、用 sendAnimation 发出（消息会变成循环动图而非视频）。
+            // 权威判据在 resolveVideoSource：那里按最终选定的媒体 URL 再判一次。
             push({
                 type: gifHash ? 'animated_gif' : 'video',
                 poster,
                 mediaId: gifHash || mediaIdFromPoster(poster),
-                // 动图封面 hash 与本体共用同一个 hash（§0.7）→ 零接口调用
+                // 动图封面 hash 与本体共用同一个 hash → 零接口调用
                 directUrl: gifHash ? `https://video.twimg.com/tweet_video/${gifHash}.mp4` : null,
                 inTweetPhoto: !!v.closest(SEL.tweetPhoto),
             });
@@ -504,7 +498,7 @@
         return null;
     }
 
-    /** 作者 URL 必须来自 DOM，不得用数字 ID 拼接（agent.md §12） */
+    /** 作者 URL 必须来自 DOM，不得用数字 ID 拼接 */
     function extractAuthorUrl(article) {
         const un = article.querySelector(SEL.userName);
         if (!un) return null;
@@ -523,7 +517,7 @@
             const a = timeEl.closest('a[href*="/status/"]');
             if (a && a.getAttribute('href')) return normalizeTweetUrl(a.getAttribute('href'));
         }
-        // 降级：作者 URL 已在手，可组装同一条推文的地址（agent.md §13 允许）
+        // 降级：作者 URL 已在手，可组装同一条推文的地址
         if (tweetId && authorUrl) {
             const name = authorUrl.split('/').pop();
             return `https://x.com/${name}/status/${tweetId}`;
@@ -540,12 +534,12 @@
             const src = img.currentSrc || img.src || '';
             if (!src || src.startsWith('data:')) continue;
             if (!img.closest(SEL.tweetPhoto)) continue;   // 必须在 tweetPhoto 容器内
-            if (isAnimatedGifCover(img)) continue;        // 动图封面归视频路径（§0.7）
+            if (isAnimatedGifCover(img)) continue;        // 动图封面归视频路径
             if (isExcluded(img, article)) continue;
             if (detectQuoteCard(img, article)) continue;  // 引用推文媒体
 
             const key = mediaKey(src);
-            if (usedKeys.has(key)) continue;              // 按媒体 ID 去重（agent.md §16）
+            if (usedKeys.has(key)) continue;              // 按媒体 ID 去重
             usedKeys.add(key);
 
             out.push({ src, mediaKey: key, alt: img.getAttribute('alt') || '' });
@@ -575,7 +569,7 @@
     }
 
     // ============================================================
-    // 9. 图片下载（agent.md §3、§15、§29）
+    // 9. 图片下载
     // ============================================================
 
     function qualityVariantsFor(src) {
@@ -606,7 +600,7 @@
     }
 
     /**
-     * 按质量降级链下载；网络错误有限重试（agent.md §15、§27、§28）。
+     * 按质量降级链下载；网络错误有限重试。
      * 返回 { blob, contentType, bytes }，调用方负责在 finally 中释放。
      */
     async function downloadImage(image) {
@@ -652,7 +646,7 @@
         return (n / 1024 / 1024).toFixed(2) + ' MB';
     }
 
-    /** 读取图片尺寸，用于 sendPhoto 的本地预检查（agent.md §7） */
+    /** 读取图片尺寸，用于 sendPhoto 的本地预检查 */
     async function readDimensions(blob) {
         try {
             if (typeof createImageBitmap === 'function') {
@@ -664,7 +658,7 @@
         } catch (e) {
             log('createImageBitmap 失败，回退到 Image + ObjectURL');
         }
-        // 回退：Object URL 必须 revoke（agent.md §3）
+        // 回退：Object URL 必须 revoke
         return new Promise((resolve) => {
             let objectUrl = null;
             const done = (dim) => {
@@ -702,19 +696,19 @@
     }
 
     // ============================================================
-    // 9b. 视频 / 动图：媒体地址解析与下载（V1.1 新增）
+    // 9b. 视频 / 动图：媒体地址解析与下载
     //
-    // 三条路线的分工（报告 §3.0、§3.5）：
+    // 三条路线的分工：
     //   动图 → 封面 hash 直接拼 /tweet_video/<hash>.mp4，零接口调用
-    //   视频 → 通路 C（登录态同源 GraphQL），失败再降级通路 A（syndication）
+    //   视频 → 通路 C（登录态同源 GraphQL），失败再降级通路 A（公开接口）
     //
-    // 【三种请求机制不可混用】
-    //   通路 C：同源 fetch + credentials:'include'（浏览器自动带 Cookie）
+    // 【三种请求机制不可混用，看起来重复但各有原因】
+    //   通路 C：同源 fetch + credentials:'include'（必须让浏览器自动带 HttpOnly Cookie）
     //   通路 A：GM_xmlhttpRequest（跨域，fetch 会被 CORS 拦截）
     //   媒体下载：GM_xmlhttpRequest + arraybuffer
     // ============================================================
 
-    // 通路 C 的 features 参数。实测只有下列组合返回 200（报告 §0.8）
+    // features 参数。实测只有下列组合返回 200，改这里之前请先在浏览器里验证
     const GRAPHQL_FEATURES = {
         creator_subscriptions_tweet_preview_api_enabled: true,
         tweetypie_unmention_optimization_enabled: true,
@@ -737,7 +731,7 @@
         rweb_video_screen_enabled: false,
     };
 
-    // 通路 C 的 variables：实测只有这一组通过，其余全部 422（报告 §0.8）
+    // variables：实测只有这一组通过，其余组合一律 422
     function graphqlVariables(tweetId) {
         return {
             focalTweetId: tweetId,
@@ -760,7 +754,7 @@
      * Bearer 是 X 前端的公开常量，从 abs.twimg.com 的 main.*.js 里取。
      * 不硬编码：X 换版后该常量会变，而这里每次页面加载只取一次并缓存（懒加载，
      * 纯图片推文永远不会触发这次下载）。
-     * 注意：只记录长度，绝不把 Bearer 写进日志（agent.md §25）。
+     * 注意：只记录长度，绝不把 Bearer 写进日志。
      */
     let bearerPromise = null;
 
@@ -828,11 +822,11 @@
             return { reason: 'network', message: e && e.message ? e.message : String(e) };
         }
 
-        // 401/403 是凭据问题，降级也救不回来，直接告诉用户（报告 §7.1）
+        // 401/403 是凭据问题，降级也救不回来，直接告诉用户
         if (res.status === 401 || res.status === 403) return { reason: `http-${res.status}`, fatal: true };
 
         // 404 = queryId 失效，422 = 参数签名变了。都只说明「这条通路坏了」，
-        // 不代表视频功能坏了 → 降级通路 A（报告 §7.1）
+        // 不代表视频功能坏了 → 降级通路 A
         if (res.status === 404 || res.status === 422) {
             logError(`通路 C 返回 HTTP ${res.status}（queryId 或参数已失效），降级到通路 A`);
             return { reason: `http-${res.status}` };
@@ -850,7 +844,7 @@
     }
 
     /**
-     * 递归收集响应里所有带 variants 的媒体节点（报告 §3.3）。
+     * 递归收集响应里所有带 variants 的媒体节点。
      * 不写死嵌套路径——X 换版时只要字段名不变就仍然有效。
      */
     function collectMediaNodes(root) {
@@ -905,7 +899,7 @@
 
     /**
      * mp4 变体排序。
-     * 通路 A 的变体带 bitrate，通路 C 的不带（报告 §3.3），
+     * 通路 A 的变体带 bitrate，通路 C 的不带，
      * 因此统一按 URL 里的 /avc1/<W>x<H>/ 面积降序，面积相同再比 bitrate。
      */
     function rankVariants(variants) {
@@ -922,8 +916,8 @@
     }
 
     /**
-     * 通路 A：syndication 兜底（报告 §3.2）。跨域，必须用 GM_xmlhttpRequest。
-     * 注意 TweetTombstone 返回的是 HTTP 200，必须解析响应体才能识别（报告 §7.2），
+     * 通路 A：公开接口兜底。跨域，必须用 GM_xmlhttpRequest。
+     * 注意 TweetTombstone 返回的是 HTTP 200，必须解析响应体才能识别，
      * 且它稳定拒绝、重试无效，所以不重试。
      */
     async function fetchViaSyndication(tweetId) {
@@ -968,10 +962,10 @@
     /**
      * 从原始响应文本里直接抓 MP4 直链。
      *
-     * 这不是「顺手写的兜底」，而是本功能**唯一被实测证明过**的提取方式：
-     * Phase 0 的探针就是用这条正则从 TweetDetail 的响应里拿到 4 档 MP4 的。
-     * 结构化解析依赖 `video_info` / `variants` 这些字段名，而字段名**没有实测过**；
+     * 这不是「顺手写的兜底」，而是**唯一被实测证明过**的提取方式。
+     * 结构化解析依赖 `video_info` / `variants` 这些字段名，而字段名**从未实测**；
      * 一旦 X 改了嵌套结构，正则仍能工作而结构解析会空手而归。
+     * 两条路都保留，先试结构化，空手而归时再退到这里。
      *
      * 媒体 id 就在 URL 路径里（`/amplify_video/<id>/...`、`/tweet_video/<hash>.mp4`），
      * 因此可以据此过滤，避免把回复里别人的视频抓进来。
@@ -1001,7 +995,7 @@
     }
 
     /**
-     * 失败文案（报告 §7.3 要求三种「拿不到」必须区分开，
+     * 失败文案（三种「拿不到」必须区分开，
      * 否则用户无法判断该换个方式还是这条推文没救了）。
      */
     function mediaLookupError(aReason, cReason) {
@@ -1021,7 +1015,7 @@
     }
 
     /**
-     * 下载前体积预检（报告 §5.3）：Range: bytes=0-0 → 206 + content-range 里的总大小。
+     * 下载前体积预检：Range: bytes=0-0 → 206 + content-range 里的总大小。
      * 若服务端忽略 Range 直接返回 200，说明整个文件已经在手，
      * 此时把 buffer 一并带出，避免白下一遍。
      */
@@ -1099,7 +1093,7 @@
     /**
      * 由【最终选定的媒体 URL】判定类型 —— 这是唯一不会骗人的判据。
      *
-     *   /tweet_video/        → 动图（X 的动图专用扁平路径，报告 §0.7）
+     *   /tweet_video/        → 动图（X 的动图专用扁平路径）
      *   /amplify_video/ 等   → 视频
      *
      * 为什么不靠 DOM：真机实测发现真实视频的 `<video>` 同样落在 tweetPhoto 容器里，
@@ -1122,7 +1116,7 @@
             + `，容器=${media.inTweetPhoto ? 'tweetPhoto' : '其他'}`
             + `，动图直链=${media.directUrl ? '有' : '无'}`);
 
-        // ① 动图：封面 hash 直接拼地址，不调任何接口（报告 §0.7、§3.5）
+        // ① 动图：封面 hash 直接拼地址，不调任何接口
         if (media.directUrl) {
             log(`动图直链（未调用接口）：${media.directUrl}`);
             const size = await probeSize(media.directUrl);
@@ -1208,7 +1202,7 @@
     }
 
     // ============================================================
-    // 10. Telegram 客户端（agent.md §5、§6、§7）
+    // 10. Telegram 客户端
     // ============================================================
 
     function apiUrl(method) {
@@ -1230,7 +1224,7 @@
         };
     }
 
-    /** 把 Telegram 错误映射成用户可读提示（agent.md §7） */
+    /** 把 Telegram 错误映射成用户可读提示 */
     function mapTelegramError(r) {
         if (r.transport) {
             return { kind: 'transport', message: r.transport === 'timeout' ? '请求超时' : '网络错误' };
@@ -1283,7 +1277,7 @@
 
     /**
      * 发送一张图片：优先 sendPhoto，必要时降级 sendDocument。
-     * 429 使用服务端 retry_after，不覆盖为本地固定延迟（agent.md §6、§28）。
+     * 429 使用服务端 retry_after，不覆盖为本地固定延迟。
      */
     /** 判断 400 是否属于「视频被拒」从而可以降级到下一个发送方法 */
     function isVideoRejection(r) {
@@ -1303,7 +1297,7 @@
             const form = new FormData();
             form.append('chat_id', CONFIG.telegramChatId);
             if (caption) form.append('caption', caption);
-            // 不手动设置 Content-Type，交给 GM_xmlhttpRequest 生成 boundary（agent.md §8）
+            // 不手动设置 Content-Type，交给 GM_xmlhttpRequest 生成 boundary
             form.append(field, blob, filename);
 
             const res = await gm({ method: 'POST', url: apiUrl(method), data: form });
@@ -1348,7 +1342,7 @@
 
     /**
      * 发送一张图片：优先 sendPhoto，必要时降级 sendDocument。
-     * 429 使用服务端 retry_after，不覆盖为本地固定延迟（agent.md §6、§28）。
+     * 429 使用服务端 retry_after，不覆盖为本地固定延迟。
      */
     async function sendImageToTelegram(blob, contentType, mediaKey, caption) {
         const filename = `x-${mediaKey}.${fileExtension(contentType)}`;
@@ -1387,9 +1381,9 @@
     }
 
     /**
-     * 发送视频 / 动图（V1.1 新增）。
+     * 发送视频 / 动图。
      *
-     * 降级链（报告 §4.3）：
+     * 降级链：
      *   动图 → sendAnimation → sendVideo → sendDocument
      *   视频 → sendVideo                → sendDocument
      * 三个方法对同一段 MP4 的接受度依次放宽，因此即使 DOM 的动图/视频判据出错，
@@ -1426,21 +1420,16 @@
     }
 
     // ============================================================
-    // 11. 上传任务编排（§17、§18、§19、§29）
+    // 11. 上传任务编排
     //
-    // 【与 agent.md 的偏差说明】
-    // agent.md §1 / §11 / §17 要求 V1 不使用 sendMediaGroup，多图逐张串行。
-    // 经用户 2026-08 决定改为：多图合并为相册（album）一次发送，链接作为
-    // 相册 caption。因此新增 CONFIG.sendAsAlbum（默认 true）。
-    //
-    // 该变更的代价（实现时已处理，但需知晓）：
+    // 【相册模式的代价 —— 这是 CONFIG.sendAsAlbum 的已知取舍】
     //   1. 相册要求所有图片在【同一个请求】中提交，因此必须先把全部图片读入内存。
-    //      这与 §17「不要一次把所有图片全部下载到内存」相反。X 单条推文最多 4 图，
-    //      按 sendPhoto 上限 10 MB 估算峰值约 40 MB。
-    //   2. 相册是「全有或全无」，无法像串行那样部分成功。因此失败时退回串行路径。
+    //      X 单条推文最多 4 图，按 sendPhoto 上限 10 MB 估算峰值约 40 MB。
+    //   2. 相册是「全有或全无」，无法像串行那样部分成功，失败时退回串行路径。
     //   3. sendMediaGroup 要求 2-10 项，故单图推文仍走单张 sendPhoto。
-    //   4. 官方文档规定相册内不能混排 photo 与 document，故若有图片超出 sendPhoto
-    //      限制，整体退回串行（由串行路径逐张各自降级）。
+    //   4. 相册内不能混排 photo 与 document，故若有图片超出 sendPhoto 限制，
+    //      整体退回串行（由串行路径逐张各自降级）。
+    //   设为 false 即退回「逐张串行、caption 挂第一张成功的图」。
     // ============================================================
 
     function releaseAll(held) {
@@ -1462,7 +1451,7 @@
                 // 逐张串行：任何时刻只持有一张图的 Blob
                 downloaded = await downloadImage(image);
 
-                // caption 只挂在第一张【成功发送】的图片上（§19）
+                // caption 只挂在第一张【成功发送】的图片上
                 const cap = state.captionSent ? null : caption;
 
                 const sent = await sendImageToTelegram(
@@ -1487,7 +1476,7 @@
                 state.lastError = msg;
                 logError(`图片 ${i + 1} 处理失败：${msg}`);
             } finally {
-                // 释放临时资源（§29）
+                // 释放临时资源
                 if (downloaded) {
                     downloaded.blob = null;
                     downloaded = null;
@@ -1644,19 +1633,19 @@
     }
 
     /**
-     * 视频 / 动图路径（V1.1 新增）。
+     * 视频 / 动图路径。
      *
-     * 串行处理，任何时刻只持有一个视频的 Blob（报告 §5.2）。
+     * 串行处理，任何时刻只持有一个视频的 Blob。
      * caption 只在「本次还没有任何消息带过它」时才挂上：
      *   纯视频推文 → 视频带 caption（否则作者链接与推文链接会全部丢失）
-     *   图文混排   → 图片已带 caption，视频不带（报告 §4.5）
+     *   图文混排   → 图片已带 caption，视频不带
      */
     async function sendVideosOfTweet(tweet, caption) {
         const state = getState(tweet.tweetId);
         let successCount = 0;
         const failures = [];
 
-        // 每次阶段变化都同步到按钮上（报告 §8.2）
+        // 每次阶段变化都同步到按钮上
         const setStage = (s) => {
             state.videoState = s;
             syncButtons(tweet.tweetId);
@@ -1703,7 +1692,7 @@
                 setStage('failed');
                 logError(`视频 ${i + 1} 处理失败：${msg}`);
             } finally {
-                // 释放临时资源（报告 §5.5）
+                // 释放临时资源
                 if (downloaded) {
                     downloaded.blob = null;
                     downloaded = null;
@@ -1752,7 +1741,7 @@
                 }
             }
 
-            // ② 视频 / 动图：固定另发一条消息，不与图片相册混排（报告 §4.5）
+            // ② 视频 / 动图：固定另发一条消息，不与图片相册混排
             if (tweet.videos.length) {
                 totalCount += tweet.videos.length;
                 const v = await sendVideosOfTweet(tweet, caption);
@@ -1770,7 +1759,7 @@
     }
 
     // ============================================================
-    // 12. 按钮注入与交互（agent.md §22、§23、§24）
+    // 12. 按钮注入与交互
     // ============================================================
 
     const ICON_PLANE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">' +
@@ -1812,7 +1801,7 @@
 
         const state = getState(tweetId);
         setButtonState(btn, state.state);
-        // 上传中禁用点击（agent.md §24）
+        // 上传中禁用点击
         btn.style.pointerEvents = state.state === 'uploading' ? 'none' : '';
 
         const activate = (ev) => {
@@ -1828,7 +1817,7 @@
         return btn;
     }
 
-    /** 同一 tweetId 的所有 DOM 副本同步状态（agent.md §21） */
+    /** 同一 tweetId 的所有 DOM 副本同步状态 */
     function syncButtons(tweetId) {
         const state = getState(tweetId);
         const nodes = document.querySelectorAll(`${SEL.ourButton}[data-tweet-id="${tweetId}"]`);
@@ -1854,7 +1843,7 @@
     const pendingArticles = new Set();
 
     function injectButton(article) {
-        if (article.querySelector(SEL.ourButton)) {   // 避免重复插入（agent.md §23）
+        if (article.querySelector(SEL.ourButton)) {   // 避免重复插入
             pendingArticles.delete(article);
             return true;
         }
@@ -1889,7 +1878,7 @@
     /**
      * 按 tweetId 反查推文容器。
      * X 会重渲染并产生同一推文的多份 DOM 副本，因此不能只依赖按钮自身的
-     * 闭包引用，需要按 tweetId 重新定位（agent.md §21）。
+     * 闭包引用，需要按 tweetId 重新定位。
      */
     function findArticleByTweetId(tweetId) {
         // 优先：同 tweetId 的其他副本按钮
@@ -1935,7 +1924,7 @@
             return;
         }
         if (!tweet.authorUrl) {
-            // 作者 URL 是必须项（agent.md §12）
+            // 作者 URL 是必须项
             toast('未能获取该推文的作者链接，已取消发送', 'error');
             return;
         }
@@ -1966,7 +1955,7 @@
     }
 
     // ============================================================
-    // 13. 扫描调度（agent.md §10、§11）
+    // 13. 扫描调度
     // ============================================================
 
     function scanRoot(root) {
@@ -2021,7 +2010,7 @@
                 if (!m.addedNodes || !m.addedNodes.length) continue;
                 for (const node of m.addedNodes) {
                     if (node.nodeType !== 1) continue;
-                    // 只关心可能含推文的新增子树（agent.md §10）
+                    // 只关心可能含推文的新增子树
                     if (node.matches && (node.matches(SEL.tweetPrimary) || node.querySelector(SEL.tweetPrimary))) {
                         pendingRoots.add(node);
                         sawTweetNode = true;
