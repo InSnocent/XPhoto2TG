@@ -1,0 +1,32 @@
+# 依赖
+node_modules/
+pnpm-lock.yaml.bak
+
+# 构建产物
+dist/
+build/
+*.min.js
+
+# 本地敏感配置（Bot Token / Chat ID 绝不入库）
+config.local.js
+.env
+.env.*
+secrets/
+*.local.json
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志 / 临时
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# agent
+agent.md
