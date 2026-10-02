@@ -2,7 +2,7 @@
 // @name         X Image to Telegram
 // @name:zh-CN   X 推文图片发送到 Telegram
 // @namespace    https://github.com/InSnocent/XPhoto2TG
-// @version      2.0.0
+// @version      2.0.1
 // @description  在 X（Twitter）每条推文上增加 Telegram 按钮，将该推文的图片、视频与动图发送到指定 Telegram 频道
 // @author       InSnocent
 // @match        https://x.com/*
@@ -775,7 +775,9 @@
         for (const url of urls.slice(0, 6)) {
             const res = await gm({
                 method: 'GET', url, responseType: 'text',
-                timeout: CONFIG.videoRequestTimeoutMs,
+                // 取的是 CDN 上已被浏览器缓存的 JS 脚本，不是几十 MB 的视频；
+                // 用视频超时会让这里的最坏耗时变成 6 × 120s。
+                timeout: CONFIG.requestTimeoutMs,
             });
             if (!res || res.status !== 200 || !res.responseText) continue;
             const m = /["'](AAAAAAAAAAAAAAAAAAAAA[^"']{20,200})["']/.exec(res.responseText)
@@ -805,10 +807,17 @@
             + `&features=${encodeURIComponent(JSON.stringify(GRAPHQL_FEATURES))}`;
 
         let res;
+        let timer = null;
         try {
+            // fetch 没有默认超时。缺了这一层，X 侧一旦不响应，这个 await 会永久挂起
+            // —— 而它是每个视频解析的第一步，会连带堵死整条上传队列。
+            const ac = new AbortController();
+            timer = setTimeout(() => ac.abort(), CONFIG.requestTimeoutMs);
+
             res = await fetch(url, {
                 method: 'GET',
                 credentials: 'include',
+                signal: ac.signal,
                 headers: {
                     authorization: `Bearer ${bearer}`,
                     'x-csrf-token': ct0,
@@ -819,7 +828,14 @@
                 },
             });
         } catch (e) {
-            return { reason: 'network', message: e && e.message ? e.message : String(e) };
+            const aborted = e && e.name === 'AbortError';
+            if (aborted) logError(`通路 C 超时（>${CONFIG.requestTimeoutMs}ms），降级到通路 A`);
+            return {
+                reason: aborted ? 'timeout' : 'network',
+                message: e && e.message ? e.message : String(e),
+            };
+        } finally {
+            if (timer) clearTimeout(timer);
         }
 
         // 401/403 是凭据问题，降级也救不回来，直接告诉用户
