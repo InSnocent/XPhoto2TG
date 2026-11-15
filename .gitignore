@@ -30,3 +30,6 @@ temp/
 
 # agent
 agent.md
+
+# 本地自检脚本（不入库；需要时从备份恢复）
+tests/

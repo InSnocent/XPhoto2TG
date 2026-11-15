@@ -2,7 +2,7 @@
 // @name         X Image to Telegram
 // @name:zh-CN   X 推文图片发送到 Telegram
 // @namespace    https://github.com/InSnocent/XPhoto2TG
-// @version      2.0.1
+// @version      2.1.0
 // @description  在 X（Twitter）每条推文上增加 Telegram 按钮，将该推文的图片、视频与动图发送到指定 Telegram 频道
 // @author       InSnocent
 // @match        https://x.com/*
@@ -86,6 +86,8 @@
         photoMaxDimensionSum: 10000,        // 宽高总和
         photoMaxAspectRatio: 20,            // 宽高比
         captionMaxChars: 1024,
+        albumMinItems: 2,                   // sendMediaGroup 下限（官方文档：2-10 项）
+        albumMaxItems: 10,                  // sendMediaGroup 上限。X 单帖最多 20 张图，故必须分块
     };
 
     // 图片质量降级链
@@ -1438,19 +1440,33 @@
     // ============================================================
     // 11. 上传任务编排
     //
-    // 【相册模式的代价 —— 这是 CONFIG.sendAsAlbum 的已知取舍】
-    //   1. 相册要求所有图片在【同一个请求】中提交，因此必须先把全部图片读入内存。
-    //      X 单条推文最多 4 图，按 sendPhoto 上限 10 MB 估算峰值约 40 MB。
-    //   2. 相册是「全有或全无」，无法像串行那样部分成功，失败时退回串行路径。
-    //   3. sendMediaGroup 要求 2-10 项，故单图推文仍走单张 sendPhoto。
-    //   4. 相册内不能混排 photo 与 document，故若有图片超出 sendPhoto 限制，
-    //      整体退回串行（由串行路径逐张各自降级）。
-    //   设为 false 即退回「逐张串行、caption 挂第一张成功的图」。
+    // 【相册必须分块，且分块必须流式 —— CONFIG.sendAsAlbum 的两条硬约束】
+    //   1. sendMediaGroup 单次只接受 2-10 项（Telegram 官方限制），而 X 单帖
+    //      最多可发 20 张图，所以超过 10 张时必须拆成多个相册依次发送。
+    //   2. 分块是流式的：下载一块 → 发一块 → 释放一块。任何时刻内存里只有
+    //      一块（≤10 张），而不是整条推文的全部图片。
+    //   3. 相册内不能混排 photo 与 document：若某块里有图片超出 sendPhoto
+    //      限制，只用该块【已下载】的 blob 逐张发送，不重新下载。
+    //   4. caption 只挂第一块的第一项。
+    //   设为 false 即退回「逐张串行」，任何时刻只持有一张图。
     // ============================================================
 
     function releaseAll(held) {
         for (const h of held) h.blob = null;
         held.length = 0;
+    }
+
+    /**
+     * 把 n 张图切成若干块，每块不超过 Telegram 相册上限。
+     * 纯函数，没有任何副作用，便于离线自检边界。
+     * @returns {number[]} 例：7 -> [7]；11 -> [10,1]；20 -> [10,10]
+     */
+    function albumPlan(n) {
+        const out = [];
+        for (let left = n; left > 0; left -= TG_LIMITS.albumMaxItems) {
+            out.push(Math.min(left, TG_LIMITS.albumMaxItems));
+        }
+        return out;
     }
 
     /** 逐张串行发送（原 V1 路径，现作为单图路径与降级路径） */
@@ -1503,6 +1519,48 @@
         }
 
         return { successCount, failures };
+    }
+
+    /**
+     * 用【已经下载好的】blob 逐张发送，不再重新下载。
+     * 供相册降级使用：既省掉一次下载，也保证任何时刻只碰手里这一块。
+     * @returns {{sent:number, failures:string[], fatal:boolean}}
+     */
+    async function sendHeldSerially(held, caption, tweetId) {
+        const state = getState(tweetId);
+        let sent = 0;
+        const failures = [];
+        let fatal = false;
+
+        for (let i = 0; i < held.length; i++) {
+            const h = held[i];
+            // caption 只挂在第一张【成功发送】的图片上
+            const cap = state.captionSent ? null : caption;
+            try {
+                const r = await sendImageToTelegram(h.blob, h.contentType, h.image.mediaKey, cap);
+                if (r.ok) {
+                    sent++;
+                    if (cap) state.captionSent = true;
+                    log(`图片 ${h.image.mediaKey} 发送成功（${r.method}${
+                        r.downgraded ? '，降级原因：' + r.downgraded : ''}）`);
+                } else {
+                    const msg = r.error ? r.error.message : '未知错误';
+                    failures.push(msg);
+                    state.lastError = msg;
+                    logError(`图片 ${h.image.mediaKey} 发送失败：${msg}`,
+                        r.response && r.response.rawText);
+                    if (r.fatal) { fatal = true; break; }
+                }
+            } catch (err) {
+                const msg = err && err.message ? err.message : String(err);
+                failures.push(msg);
+                state.lastError = msg;
+                logError(`图片 ${h.image.mediaKey} 处理失败：${msg}`);
+            }
+            if (i < held.length - 1) await sleep(CONFIG.sendDelayMs);
+        }
+
+        return { sent, failures, fatal };
     }
 
     /**
@@ -1559,91 +1617,108 @@
     }
 
     /**
-     * 相册路径。
-     * @returns {{sent:number, failures:string[], fallbackToSerial:boolean}}
+     * 相册路径：按块流式发送。
+     * 每块独立完成「下载 → 判断 → 发送 → 释放」，`sendAlbumChunk` 返回时
+     * 该块 blob 已释放，所以任何时刻内存里只有一块（≤ albumMaxItems 张）。
+     * @returns {{sent:number, failures:string[]}}
      */
     async function sendAsAlbum(tweet, caption) {
         const state = getState(tweet.tweetId);
         const failures = [];
+        const sizes = albumPlan(tweet.images.length);
+        let sent = 0;
+        let offset = 0;
+
+        for (let c = 0; c < sizes.length; c++) {
+            const slice = tweet.images.slice(offset, offset + sizes[c]);
+            offset += sizes[c];
+
+            const r = await sendAlbumChunk(slice, c + 1, sizes.length, caption, tweet.tweetId);
+            sent += r.sent;
+            failures.push(...r.failures);
+            if (r.fatal) break;
+            if (c < sizes.length - 1) await sleep(CONFIG.sendDelayMs);
+        }
+
+        if (!sent && failures.length) state.lastError = failures[0];
+        return { sent, failures };
+    }
+
+    /**
+     * 发送一块图片。块内任何时刻只持有这一块的 blob，返回前必然全部释放。
+     * 三种发送方式在这块内部决定：
+     *   - 只剩 1 张        → 单张 sendPhoto（相册要求 ≥2 项）
+     *   - 有图超出 photo 限制 → 用【已下载】的 blob 逐张发（相册不能混排 photo/document）
+     *   - 其余             → 一个 sendMediaGroup 相册
+     * @returns {{sent:number, failures:string[], fatal:boolean}}
+     */
+    async function sendAlbumChunk(images, index, total, caption, tweetId) {
+        const state = getState(tweetId);
+        const failures = [];
         const held = [];
-
-        // 相册必须在同一请求中提交，故先全部下载（代价见本节顶部说明）
-        for (const image of tweet.images) {
-            try {
-                const d = await downloadImage(image);
-                held.push({ image, blob: d.blob, contentType: d.contentType, bytes: d.bytes });
-            } catch (err) {
-                const msg = err && err.message ? err.message : String(err);
-                failures.push(msg);
-                logError(`相册：图片 ${image.mediaKey} 下载失败：${msg}`);
-            }
-        }
-
-        if (!held.length) {
-            state.lastError = failures[0] || '全部图片获取失败';
-            return { sent: 0, failures, fallbackToSerial: false };
-        }
-
-        // 相册要求 2-10 项，只剩一张时退回单张发送
-        if (held.length === 1) {
-            log('相册仅剩 1 张图，退回单张 sendPhoto');
-            try {
-                const cap = state.captionSent ? null : caption;
-                const sent = await sendImageToTelegram(
-                    held[0].blob, held[0].contentType, held[0].image.mediaKey, cap);
-                if (sent.ok) {
-                    if (cap) state.captionSent = true;
-                    return { sent: 1, failures, fallbackToSerial: false };
-                }
-                const msg = sent.error ? sent.error.message : '发送失败';
-                failures.push(msg);
-                state.lastError = msg;
-                return { sent: 0, failures, fallbackToSerial: false };
-            } finally {
-                releaseAll(held);
-            }
-        }
-
-        // 决定相册类型：首选 photo，若有图片超出 sendPhoto 限制则整体退回串行
-        let itemType = 'photo';
-        if (CONFIG.preferDocumentForOriginal) {
-            itemType = 'document';
-        } else {
-            for (const h of held) {
-                const dims = await readDimensions(h.blob);
-                const fail = await photoPrecheck(h.blob, dims);
-                if (fail) {
-                    log(`相册中有图片不满足 sendPhoto 限制（${fail}），整体退回串行发送`);
-                    releaseAll(held);
-                    // 串行路径会对每张图各自降级，容错更好
-                    return { sent: 0, failures, fallbackToSerial: true };
-                }
-            }
-        }
+        let sent = 0;
 
         try {
+            // 只下载这一块
+            for (const image of images) {
+                try {
+                    const d = await downloadImage(image);
+                    held.push({ image, blob: d.blob, contentType: d.contentType, bytes: d.bytes });
+                } catch (err) {
+                    const msg = err && err.message ? err.message : String(err);
+                    failures.push(msg);
+                    logError(`第 ${index}/${total} 块：图片 ${image.mediaKey} 下载失败：${msg}`);
+                }
+            }
+
+            if (!held.length) {
+                log(`第 ${index}/${total} 块没有可用图片，跳过`);
+                return { sent, failures, fatal: false };
+            }
+
+            let mode = 'album';
+            let itemType = 'photo';
+            if (held.length === 1) {
+                log(`第 ${index}/${total} 块只剩 1 张，改用单张 sendPhoto`);
+                mode = 'serial';
+            } else if (CONFIG.preferDocumentForOriginal) {
+                itemType = 'document';
+            } else {
+                for (const h of held) {
+                    const dims = await readDimensions(h.blob);
+                    const fail = await photoPrecheck(h.blob, dims);
+                    if (fail) {
+                        log(`第 ${index}/${total} 块有图片不满足 sendPhoto 限制（${fail}），本块改走逐张发送`);
+                        mode = 'serial';
+                        break;
+                    }
+                }
+            }
+
+            if (mode === 'serial') {
+                const r = await sendHeldSerially(held, caption, tweetId);
+                return { sent: r.sent, failures: failures.concat(r.failures), fatal: r.fatal };
+            }
+
             const cap = state.captionSent ? null : caption;
-            log(`发送相册：${held.length} 张，类型=${itemType}，总大小=${
+            log(`发送相册 ${index}/${total}：${held.length} 张，类型=${itemType}，总大小=${
                 formatBytes(held.reduce((n, h) => n + h.bytes, 0))}`);
 
-            const sent = await sendMediaGroupAlbum(held, cap, itemType);
-            if (sent.ok) {
+            const r = await sendMediaGroupAlbum(held, cap, itemType);
+            if (r.ok) {
+                sent = r.count;
                 if (cap) state.captionSent = true;
-                return { sent: sent.count, failures, fallbackToSerial: false };
+                log(`相册 ${index}/${total} 发送成功（${r.count} 张）`);
+                return { sent, failures, fatal: false };
             }
 
-            const msg = sent.error ? sent.error.message : '相册发送失败';
-            logError(`相册发送失败：${msg}`, sent.response && sent.response.rawText);
-
-            if (sent.fatal) {
-                failures.push(msg);
-                state.lastError = msg;
-                return { sent: 0, failures, fallbackToSerial: false };
-            }
-            // 非致命错误：退回串行发送
-            log('相册发送失败，退回逐张串行发送');
-            return { sent: 0, failures, fallbackToSerial: true };
+            const msg = r.error ? r.error.message : '相册发送失败';
+            logError(`相册 ${index}/${total} 发送失败：${msg}`, r.response && r.response.rawText);
+            failures.push(msg);
+            state.lastError = msg;
+            return { sent: 0, failures, fatal: !!r.fatal };
         } finally {
+            // 无论成败，这一块的 blob 立刻释放，绝不跨块持有
             releaseAll(held);
         }
     }
@@ -1735,7 +1810,7 @@
         const failures = [];
 
         try {
-            // ① 图片：完全沿用 V1 路径，行为不变
+            // ① 图片：≥2 张走分块相册（降级在块内完成），单张走原有串行路径
             if (tweet.images.length) {
                 totalCount += tweet.images.length;
                 const useAlbum = CONFIG.sendAsAlbum && tweet.images.length >= 2;
@@ -1744,12 +1819,6 @@
                     const r = await sendAsAlbum(tweet, caption);
                     successCount += r.sent;
                     failures.push(...r.failures);
-
-                    if (r.fallbackToSerial) {
-                        const s = await sendSerially(tweet, caption);
-                        successCount += s.successCount;
-                        failures.push(...s.failures);
-                    }
                 } else {
                     const s = await sendSerially(tweet, caption);
                     successCount += s.successCount;

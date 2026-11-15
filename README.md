@@ -11,7 +11,7 @@ Current version: **2.0.1**.
 - Inject a Telegram button into the action bar of each tweet (**a reply also includes a button**, each sending only the media from that specific tweet).
 - Supports **static images**, **videos**, and **GIFs / animated images**.
 - Media is always processed as in-memory `Blob` / `ArrayBuffer`, **without writing to disk or creating caches**.
-- Multiple images are merged into one **album** by default and sent at once, with the tweet link serving as the album caption; you can configure it to revert to sequential single-image sending.
+- Multiple images are merged into **albums** by default, with the tweet link as the caption. Telegram allows at most 10 items per album and X allows up to 20 images per post, so longer posts are split into consecutive albums and streamed one chunk at a time.
 - Animated GIFs are directly constructed from the cover URL's hash into an MP4 direct link, **without calling any API**.
 - Videos are fetched via **authenticated same-origin GraphQL** for the highest quality MP4 tier (restricted content can also be retrieved); failure automatically degrades to a public API.
 - Videos undergo **pre-size inspection before download** using `Range` requests, automatically selecting the first tier that does not exceed 50 MB.
@@ -68,15 +68,17 @@ const CONFIG = {
 
 | Mode | Effect | Trade-off |
 | --- | --- | --- |
-| `sendAsAlbum: true` (default) | All images are merged into a single album message + a link caption | Must load all images into memory first; the album is "all-or-nothing": if one image fails, there is no partial success |
+| `sendAsAlbum: true` (default) | Images are merged into albums of at most 10, with the link caption on the first one | Only the chunk being sent (≤10 images) is held in memory, never the whole post; a failed chunk does not block the remaining ones |
 | `sendAsAlbum: false` | Send each image independently, with the caption of the first successful image | Creates multiple separate messages in the channel, leading to a more fragmented browsing experience |
 
-Fallback behavior for album mode (automatically handled, no configuration required):
+Chunking and fallback behavior (automatic, no configuration required):
 
-- Single-image tweet → Still uses individual `sendPhoto` (album requires 2–10 items)
-- If the number of images exceeds the `sendPhoto` limit → Falls back to sending every image one by one, where each image is downgraded individually
-- If some images fail to download → Use remaining images to form an album; if only 1 image remains, fall back to single-image sending
-- Album sending fails (non-critical) → Falls back to serial sending of individual images
+- Up to 10 images → a single album (`sendMediaGroup` accepts 2–10 items only)
+- More than 10 images → split into consecutive albums, with the caption on the first one only. Each chunk is downloaded, sent and released before the next one starts
+- A chunk left with a single image (e.g. 11 images → 10 + 1) → sent with a plain `sendPhoto`
+- An image in a chunk exceeds the `sendPhoto` limits → that chunk is sent one image at a time using the blobs already in memory, so nothing is downloaded twice
+- Some images fail to download → they are skipped and the rest of the chunk is still sent
+- A chunk fails (non-critical) → the remaining chunks are still attempted
 
 #### The difference between sendPhoto and sendDocument
 
@@ -214,7 +216,7 @@ The Bot Token in the logs should always be displayed as `<redacted>`; you can sa
 - **`graphqlQueryId` breaks whenever X ships a release**; when it does, the script automatically degrades to the public API (maximum quality 1280x720), and the logs will indicate the update
 - **Send history is not persisted**; state exists only in memory and is cleared upon page refresh
 - **The runtime environment must have access to `api.telegram.org`**; otherwise, sending will fail
-- **Album mode has high peak memory usage**: It requires holding all images simultaneously; 4 images at 10 MB each is roughly 40 MB. When memory is tight, set `sendAsAlbum: false`
+- **Album mode memory is capped per chunk**: only the chunk being sent (≤10 images) is held at any moment, and it is released right after. A 20-image post never holds 20 blobs at once
 
 ## Project Structure
 
