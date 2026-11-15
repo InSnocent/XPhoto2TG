@@ -4,7 +4,6 @@
 
 A one-click script for Tampermonkey users to send images, videos, and animated GIFs from an X (Twitter) tweet to a Telegram channel.
 
-Current version: **2.0.1**.
 
 ## Features
 
