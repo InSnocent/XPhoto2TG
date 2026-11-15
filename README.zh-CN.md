@@ -4,7 +4,6 @@
 
 把 X（Twitter）推文里的图片、视频与动图一键发送到 Telegram 频道的 Tampermonkey 用户脚本。
 
-当前版本 **2.0.1**。
 
 ## 特性
 
